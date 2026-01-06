@@ -1,0 +1,7 @@
+# SAM3 requires transformers >= 5.0.0 (pre-release as of Jan 2026)
+# Transformers is installed via Dockerfile with --pre flag
+torch>=2.0.0
+accelerate>=0.26.0
+Pillow>=9.0.0
+numpy>=1.21.0
+huggingface_hub>=0.20.0

@@ -1,0 +1,73 @@
+version: "3.8"
+
+services:
+  sam3-backend:
+    container_name: sam3-ml-backend
+    build:
+      context: .
+      args:
+        TEST_ENV: ${TEST_ENV:-false}
+
+    # Uncomment for GPU support (requires NVIDIA Docker runtime)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+    environment:
+      # Hugging Face authentication - REQUIRED for SAM3 (gated model)
+      # Option 1: Set HF_TOKEN environment variable before running docker-compose
+      # Option 2: Mount a file containing the token (see volumes section)
+      - HF_TOKEN=${HF_TOKEN:-}
+
+      # Logging and debug
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+      # Model configuration
+      - MODEL_NAME=${MODEL_NAME:-facebook/sam3}
+      - DEVICE=${DEVICE:-cpu}
+
+      # Server configuration
+      - WORKERS=${WORKERS:-1}
+      - THREADS=${THREADS:-4}
+      - PORT=9090
+
+      # Model storage directory
+      - MODEL_DIR=/data/models
+
+      # Label Studio connection settings
+      # IMPORTANT: Do NOT use 'localhost' when Label Studio runs in Docker!
+      # Use your machine's actual IP address (find with: ifconfig or ipconfig)
+      # Example: http://192.168.1.100:8080
+      - LABEL_STUDIO_URL=${LABEL_STUDIO_URL:-}
+      - LABEL_STUDIO_API_KEY=${LABEL_STUDIO_API_KEY:-}
+
+      # Optional basic auth for the ML backend
+      - BASIC_AUTH_USER=${BASIC_AUTH_USER:-}
+      - BASIC_AUTH_PASS=${BASIC_AUTH_PASS:-}
+
+    ports:
+      - "9090:9090"
+
+    volumes:
+      # Persistent storage for model cache and data
+      - ./data/server:/data
+
+      # Optional: Mount HF token from file (alternative to env var)
+      # Uncomment the following line and update the path to your token file
+      # - /path/to/your/.hf_token:/app/.hf_token:ro
+
+      # Mount Hugging Face cache to avoid re-downloading models
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    restart: unless-stopped
