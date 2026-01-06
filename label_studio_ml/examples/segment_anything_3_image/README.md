@@ -1,5 +1,7 @@
 # SAM3 (Segment Anything Model 3) for Label Studio
 
+[![Build SAM3 Docker Image](https://github.com/Glidance/label-studio-ml-backend/actions/workflows/docker-build.yml/badge.svg)](https://github.com/Glidance/label-studio-ml-backend/actions/workflows/docker-build.yml)
+
 Interactive image segmentation using Meta's SAM3 model via Hugging Face Transformers.
 
 ## Overview
