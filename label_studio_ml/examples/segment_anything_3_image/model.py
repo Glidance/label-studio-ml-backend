@@ -208,37 +208,74 @@ class SAM3Model(LabelStudioMLBase):
                 outputs = model(**inputs, multimask_output=True)
 
         elif MODEL_TYPE == "sam3":
-            # Sam3Processor format - uses text and boxes (NOT points)
-            # Use domain-specific prompts for better segmentation accuracy
+            # HYBRID TWO-STAGE APPROACH:
+            # Stage 1: Use text prompt to find ALL instances of the concept
+            # Stage 2: Filter by which mask contains the user's click point
             text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "navigable surface"
             logger.info(f"Using text prompt: '{text_prompt}' for label: '{label}'")
 
-            input_boxes_tensor = None
-            input_boxes_labels = None
-
-            # Convert point to a small box if provided (Sam3 doesn't support points directly)
-            if point_coords and len(point_coords) > 0:
-                # Create a small box around the point (e.g., 20x20 pixels)
-                px, py = point_coords[0]
-                box_size = 10
-                input_box = [px - box_size, py - box_size, px + box_size, py + box_size]
-                logger.info(f"Converting point ({px}, {py}) to box: {input_box}")
-
-            # Add box prompt if provided
-            if input_box is not None:
-                input_boxes_tensor = [[input_box]]
-                input_boxes_labels = [[1]]  # Positive box
-
+            # Stage 1: Text-only inference to find all matching instances
             inputs = processor(
                 images=image,
                 text=text_prompt,
-                input_boxes=input_boxes_tensor,
-                input_boxes_labels=input_boxes_labels,
                 return_tensors="pt"
             ).to(DEVICE)
 
             with torch.no_grad():
                 outputs = model(**inputs)
+
+            # Stage 2: Post-process and filter by click point
+            results = processor.post_process_instance_segmentation(
+                outputs,
+                threshold=0.3,  # Lower threshold to catch more candidates
+                mask_threshold=0.5,
+                target_sizes=[list(image.size[::-1])]  # (height, width)
+            )[0]
+
+            num_masks = len(results.get('masks', []))
+            logger.info(f"Text detection found {num_masks} mask(s)")
+
+            # Stage 3: Find mask containing user's click point
+            if num_masks > 0 and point_coords and len(point_coords) > 0:
+                click_x, click_y = point_coords[0]
+                logger.info(f"Filtering {num_masks} masks by click point ({click_x}, {click_y})")
+
+                best_mask = None
+                best_score = 0
+
+                for i, mask in enumerate(results['masks']):
+                    mask_np = mask.cpu().numpy().astype(np.uint8)
+                    # Check if click point is inside this mask
+                    if 0 <= click_y < mask_np.shape[0] and 0 <= click_x < mask_np.shape[1]:
+                        if mask_np[click_y, click_x] > 0:
+                            score = float(results['scores'][i].cpu().numpy())
+                            logger.info(f"  Mask {i}: contains click, score={score:.3f}")
+                            if score > best_score:
+                                best_mask = mask_np
+                                best_score = score
+
+                if best_mask is not None:
+                    logger.info(f"Selected mask with score {best_score:.3f}")
+                    return {'masks': [best_mask], 'probs': [best_score]}
+                else:
+                    logger.warning(f"No mask contains click point ({click_x}, {click_y}), returning highest-scoring mask")
+                    # Fallback: return highest scoring mask
+                    best_idx = int(torch.argmax(results['scores']))
+                    best_mask = results['masks'][best_idx].cpu().numpy().astype(np.uint8)
+                    best_prob = float(results['scores'][best_idx].cpu().numpy())
+                    return {'masks': [best_mask], 'probs': [best_prob]}
+
+            elif num_masks > 0:
+                # No point provided - return best mask
+                logger.info("No click point provided, returning highest-scoring mask")
+                best_idx = int(torch.argmax(results['scores']))
+                best_mask = results['masks'][best_idx].cpu().numpy().astype(np.uint8)
+                best_prob = float(results['scores'][best_idx].cpu().numpy())
+                return {'masks': [best_mask], 'probs': [best_prob]}
+
+            else:
+                logger.warning("No masks found by text detection")
+                return {'masks': [], 'probs': []}
 
         else:
             # Generic AutoModel fallback
@@ -262,24 +299,7 @@ class SAM3Model(LabelStudioMLBase):
             best_mask = masks[0, best_idx].numpy().astype(np.uint8)
             best_prob = float(scores[best_idx])
 
-        elif MODEL_TYPE == "sam3":
-            # Sam3: post_process_instance_segmentation returns dict with masks, boxes, scores
-            results = processor.post_process_instance_segmentation(
-                outputs,
-                threshold=0.5,
-                mask_threshold=0.5,
-                target_sizes=inputs.get("original_sizes").tolist()
-            )[0]  # Get first batch item
-
-            if len(results.get('masks', [])) > 0:
-                # Get the best mask by score
-                best_idx = np.argmax(results['scores'].cpu().numpy())
-                best_mask = results['masks'][best_idx].cpu().numpy().astype(np.uint8)
-                best_prob = float(results['scores'][best_idx].cpu().numpy())
-            else:
-                # No masks found - return empty
-                logger.warning("No masks found in Sam3 output")
-                return {'masks': [], 'probs': []}
+        # Note: MODEL_TYPE == "sam3" returns early in the inference block above
 
         else:
             # Fallback for AutoModel - try different output formats
