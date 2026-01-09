@@ -40,13 +40,15 @@ HF_TOKEN = os.getenv('HF_TOKEN', os.getenv('HUGGING_FACE_HUB_TOKEN', None))
 logger.info(f"Using device: {DEVICE}")
 logger.info(f"Loading model: {MODEL_NAME}")
 
-# Initialize model and processor
-# Try multiple model/processor combinations for compatibility
+# Initialize models and processors
+# Method 4 (Hybrid): Load BOTH text-capable and point-only models for fallback
 processor = None
 model = None
+tracker_processor = None
+tracker_model = None
+MODEL_TYPE = None
 
-# Method 1: Try Sam3Processor/Model FIRST (supports TEXT prompts + boxes)
-# This is critical for domain-specific text prompting
+# Load Sam3Model (text-capable) as primary
 try:
     from transformers import Sam3Processor, Sam3Model
     processor = Sam3Processor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
@@ -56,27 +58,35 @@ try:
     logger.info("SAM3 model (text-capable) loaded successfully")
 except Exception as e:
     logger.warning(f"Sam3 (text-capable) failed: {e}")
-    # Fallback to Sam3TrackerProcessor/Model (supports points and boxes, NO text)
+
+# Also load Sam3TrackerModel (point-only) for fallback when text confidence is low
+try:
+    from transformers import Sam3TrackerProcessor, Sam3TrackerModel
+    tracker_processor = Sam3TrackerProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+    tracker_model = Sam3TrackerModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
+    tracker_model.eval()
+    logger.info("SAM3 Tracker (point-only) loaded for fallback")
+except Exception as e:
+    logger.warning(f"Sam3Tracker fallback failed: {e}")
+
+# If primary model failed, use tracker as primary
+if MODEL_TYPE is None and tracker_processor is not None:
+    processor = tracker_processor
+    model = tracker_model
+    MODEL_TYPE = "sam3_tracker"
+    logger.warning("Using SAM3 Tracker as primary - TEXT PROMPTS NOT AVAILABLE")
+
+# Last resort: AutoModel
+if MODEL_TYPE is None:
     try:
-        from transformers import Sam3TrackerProcessor, Sam3TrackerModel
-        processor = Sam3TrackerProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
-        model = Sam3TrackerModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
+        from transformers import AutoProcessor, AutoModel
+        processor = AutoProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        model = AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
         model.eval()
-        MODEL_TYPE = "sam3_tracker"
-        logger.warning("SAM3 Tracker loaded - TEXT PROMPTS NOT AVAILABLE")
-    except Exception as e2:
-        logger.warning(f"Sam3Tracker failed: {e2}")
-        # Fallback to AutoModel/AutoProcessor
-        try:
-            from transformers import AutoProcessor, AutoModel
-            processor = AutoProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
-            model = AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
-            model.eval()
-            MODEL_TYPE = "auto"
-            logger.info("SAM3 model loaded via AutoModel")
-        except Exception as e3:
-            logger.error(f"Failed to load SAM3 model: {e3}")
-            MODEL_TYPE = None
+        MODEL_TYPE = "auto"
+        logger.info("SAM3 model loaded via AutoModel")
+    except Exception as e:
+        logger.error(f"Failed to load any SAM3 model: {e}")
 
 
 class SAM3Model(LabelStudioMLBase):
@@ -156,6 +166,61 @@ class SAM3Model(LabelStudioMLBase):
         image = Image.open(image_path).convert("RGB")
         return image
 
+    def _point_only_predict(self, image: Image.Image, point_coords: List,
+                             point_labels: List) -> Dict:
+        """Run point-only prediction using Sam3TrackerModel.
+
+        Used as fallback when text prompt confidence is low.
+
+        Args:
+            image: PIL Image
+            point_coords: List of [x, y] point coordinates
+            point_labels: List of point labels (1=positive, 0=negative)
+
+        Returns:
+            Dictionary with 'masks' and 'probs' keys
+        """
+        if tracker_processor is None or tracker_model is None:
+            logger.warning("Tracker model not available for point-only fallback")
+            return {'masks': [], 'probs': []}
+
+        # Sam3TrackerProcessor format:
+        # input_points: [batch, objects, points_per_object, coords]
+        # input_labels: [batch, objects, points_per_object]
+        input_points_tensor = [[point_coords]]
+        input_labels_tensor = [[point_labels]]
+
+        inputs = tracker_processor(
+            images=image,
+            input_points=input_points_tensor,
+            input_labels=input_labels_tensor,
+            return_tensors="pt"
+        ).to(DEVICE)
+
+        with torch.no_grad():
+            outputs = tracker_model(**inputs, multimask_output=True)
+
+        # Post-process masks
+        masks = tracker_processor.post_process_masks(
+            outputs.pred_masks.cpu(),
+            inputs["original_sizes"]
+        )[0]  # Get first batch item
+
+        # Get scores - outputs.iou_scores has shape [batch, objects, num_masks]
+        scores = outputs.iou_scores.cpu().numpy()[0, 0]  # [num_masks]
+
+        # Select best mask (highest IoU score)
+        best_idx = np.argmax(scores)
+        best_mask = masks[0, best_idx].numpy().astype(np.uint8)
+        best_prob = float(scores[best_idx])
+
+        logger.info(f"Point-only fallback: mask with score {best_prob:.3f}")
+
+        return {
+            'masks': [best_mask],
+            'probs': [best_prob]
+        }
+
     def _sam_predict(self, img_url: str, point_coords: Optional[List] = None,
                      point_labels: Optional[List] = None, input_box: Optional[List] = None,
                      task: Optional[Dict] = None, label: Optional[str] = None) -> Dict:
@@ -234,6 +299,12 @@ class SAM3Model(LabelStudioMLBase):
             if hasattr(outputs, 'presence_logits') and outputs.presence_logits is not None:
                 presence = torch.sigmoid(outputs.presence_logits[0, 0]).item()
 
+            # METHOD 4 HYBRID: Fall back to point-only if text confidence is low
+            PRESENCE_THRESHOLD = 0.5
+            if presence < PRESENCE_THRESHOLD and point_coords and len(point_coords) > 0:
+                logger.info(f"Presence {presence:.3f} < {PRESENCE_THRESHOLD}, falling back to point-only")
+                return self._point_only_predict(image, point_coords, point_labels or [1] * len(point_coords))
+
             # Compute final scores: pred_logits * presence
             final_scores = pred_logits * presence  # [200]
 
@@ -241,7 +312,7 @@ class SAM3Model(LabelStudioMLBase):
             threshold = 0.05
             keep_indices = torch.where(final_scores > threshold)[0]
 
-            logger.info(f"Presence: {presence:.3f}, kept {len(keep_indices)}/{len(final_scores)} masks above threshold {threshold}")
+            logger.info(f"Presence: {presence:.3f} (above threshold), kept {len(keep_indices)}/{len(final_scores)} masks")
             if len(keep_indices) > 0:
                 top_scores = final_scores[keep_indices][:10]
                 logger.info(f"Top filtered scores: {top_scores.tolist()}")
