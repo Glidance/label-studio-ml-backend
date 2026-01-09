@@ -254,7 +254,8 @@ class SAM3Model(LabelStudioMLBase):
             except Exception as e:
                 logger.warning(f"post_process_instance_segmentation failed: {e}")
 
-            # Approach 2: Try post_process_semantic_segmentation if instance seg found nothing
+            # Approach 2: Use semantic segmentation if instance seg found nothing
+            semantic_mask = None
             if num_masks == 0:
                 try:
                     semantic_results = processor.post_process_semantic_segmentation(
@@ -264,12 +265,18 @@ class SAM3Model(LabelStudioMLBase):
                     logger.info(f"Semantic segmentation result type: {type(semantic_results)}, shape: {semantic_results.shape if hasattr(semantic_results, 'shape') else 'N/A'}")
                     # Semantic seg returns class labels per pixel - check unique values
                     if hasattr(semantic_results, 'unique'):
-                        logger.info(f"Unique classes in semantic output: {semantic_results.unique()}")
+                        unique_classes = semantic_results.unique()
+                        logger.info(f"Unique classes in semantic output: {unique_classes}")
+                        # Class 1 is typically the positive detection (class 0 is background)
+                        if len(unique_classes) > 1:
+                            # Create binary mask where class > 0
+                            semantic_mask = (semantic_results > 0).cpu().numpy().astype(np.uint8)
+                            logger.info(f"Created semantic mask with {semantic_mask.sum()} positive pixels")
                 except Exception as e:
                     logger.warning(f"post_process_semantic_segmentation failed: {e}")
 
             # Approach 3: Try direct mask extraction if outputs has pred_masks
-            if num_masks == 0 and hasattr(outputs, 'pred_masks'):
+            if num_masks == 0 and semantic_mask is None and hasattr(outputs, 'pred_masks'):
                 try:
                     pred_masks = outputs.pred_masks
                     logger.info(f"Direct pred_masks - shape: {pred_masks.shape}, min: {pred_masks.min():.3f}, max: {pred_masks.max():.3f}")
@@ -280,6 +287,32 @@ class SAM3Model(LabelStudioMLBase):
                 except Exception as e:
                     logger.warning(f"Direct mask extraction failed: {e}")
             logger.info(f"Text detection found {num_masks} mask(s)")
+
+            # NEW: If we have a semantic mask, use it with click-point filtering
+            if semantic_mask is not None and point_coords and len(point_coords) > 0:
+                click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
+                logger.info(f"Using semantic segmentation with click point ({click_x}, {click_y})")
+
+                # Check if click is in the semantic mask
+                if 0 <= click_y < semantic_mask.shape[0] and 0 <= click_x < semantic_mask.shape[1]:
+                    if semantic_mask[click_y, click_x] > 0:
+                        # Use connected component analysis to get only the region containing the click
+                        from scipy import ndimage
+                        labeled_mask, num_features = ndimage.label(semantic_mask)
+                        click_label = labeled_mask[click_y, click_x]
+                        logger.info(f"Found {num_features} connected components, click is in component {click_label}")
+
+                        if click_label > 0:
+                            # Extract just the connected component containing the click
+                            component_mask = (labeled_mask == click_label).astype(np.uint8)
+                            logger.info(f"Returning connected component with {component_mask.sum()} pixels")
+                            return {'masks': [component_mask], 'probs': [0.8]}  # Confidence score
+                    else:
+                        logger.warning(f"Click point ({click_x}, {click_y}) is not in semantic mask, returning full mask")
+                        return {'masks': [semantic_mask], 'probs': [0.6]}
+                else:
+                    logger.warning(f"Click point ({click_x}, {click_y}) out of bounds for mask {semantic_mask.shape}")
+                    return {'masks': [semantic_mask], 'probs': [0.5]}
 
             # Stage 3: Find mask containing user's click point
             if num_masks > 0 and point_coords and len(point_coords) > 0:
