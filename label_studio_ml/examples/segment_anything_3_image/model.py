@@ -19,6 +19,19 @@ from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_lo
 
 logger = logging.getLogger(__name__)
 
+# Domain-specific prompts for blind navigation robot segmentation
+# These rich descriptions help SAM3's text understanding produce better masks
+DOMAIN_PROMPTS = {
+    "road": "vehicle traffic surface that is dangerous for pedestrian crossing",
+    "paved path": "smooth concrete or asphalt surface safe for walking and mobility devices",
+    "marked crossing": "painted crosswalk or pedestrian crossing area with traffic signals or signs",
+    "unpaved path": "dirt, gravel, or natural surface trail for walking",
+    "driveway": "private vehicle access between road and building, watch for vehicles",
+    "staircase": "steps or stairs requiring careful navigation with handrails",
+    "mixed use": "shared space for pedestrians and vehicles requiring caution",
+    "walkable space": "open area safe for pedestrian movement and navigation",
+}
+
 # Environment configuration
 DEVICE = os.getenv('DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
 MODEL_NAME = os.getenv('MODEL_NAME', 'facebook/sam3')
@@ -196,7 +209,9 @@ class SAM3Model(LabelStudioMLBase):
         elif MODEL_TYPE == "sam3":
             # Sam3Processor format - uses text and boxes
             # For boxes: input_boxes = [[box]], input_boxes_labels = [[1]] (1=positive, 0=negative)
-            text_prompt = label if label else "object"
+            # Use domain-specific prompts for better segmentation accuracy
+            text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "navigable surface"
+            logger.info(f"Using text prompt: '{text_prompt}' for label: '{label}'")
             input_boxes_tensor = None
             input_boxes_labels = None
 
