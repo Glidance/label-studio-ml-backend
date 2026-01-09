@@ -1,10 +1,13 @@
-name: Build SAM3 Docker Image - Method 1 (Domain Prompts)
+name: Build SAM3 Docker Image
 
 on:
   workflow_dispatch:
   push:
     branches:
       - sam3-method1-domain
+      - sam3-method4-hybrid
+      - sam3-method5-postprocess
+      - sam3-method6-multiprompt
     paths:
       - 'label_studio_ml/examples/segment_anything_3_image/**'
       - '.github/workflows/docker-build.yml'
