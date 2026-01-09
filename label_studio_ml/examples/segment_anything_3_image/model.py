@@ -229,10 +229,17 @@ class SAM3Model(LabelStudioMLBase):
             logger.info(f"Model outputs keys/attrs: {outputs.keys() if hasattr(outputs, 'keys') else dir(outputs)}")
             if hasattr(outputs, 'pred_masks'):
                 logger.info(f"pred_masks shape: {outputs.pred_masks.shape}")
-            if hasattr(outputs, 'scores'):
-                logger.info(f"scores shape: {outputs.scores.shape}, values: {outputs.scores}")
-            if hasattr(outputs, 'logits'):
-                logger.info(f"logits shape: {outputs.logits.shape}")
+            if hasattr(outputs, 'pred_logits'):
+                logits = outputs.pred_logits
+                logger.info(f"pred_logits shape: {logits.shape}")
+                # Apply softmax/sigmoid to get probabilities
+                probs = torch.sigmoid(logits)
+                top_probs, top_indices = probs[0, :, 0].topk(10)  # Top 10 mask probabilities
+                logger.info(f"Top 10 mask probabilities: {top_probs.tolist()}")
+                logger.info(f"Top 10 mask indices: {top_indices.tolist()}")
+            if hasattr(outputs, 'presence_logits'):
+                presence = torch.sigmoid(outputs.presence_logits)
+                logger.info(f"presence_logits shape: {outputs.presence_logits.shape}, top values: {presence[0, :10].tolist()}")
             if hasattr(outputs, 'pred_boxes'):
                 logger.info(f"pred_boxes shape: {outputs.pred_boxes.shape}")
 
@@ -275,20 +282,65 @@ class SAM3Model(LabelStudioMLBase):
                 except Exception as e:
                     logger.warning(f"post_process_semantic_segmentation failed: {e}")
 
-            # Approach 3: Try direct mask extraction if outputs has pred_masks
-            if num_masks == 0 and semantic_mask is None and hasattr(outputs, 'pred_masks'):
+            # Approach 3: Try direct mask extraction using pred_masks + pred_logits
+            direct_mask = None
+            if num_masks == 0 and semantic_mask is None and hasattr(outputs, 'pred_masks') and hasattr(outputs, 'pred_logits'):
                 try:
-                    pred_masks = outputs.pred_masks
+                    pred_masks = outputs.pred_masks  # [1, 200, 288, 288]
+                    pred_logits = outputs.pred_logits  # [1, 200, num_classes]
                     logger.info(f"Direct pred_masks - shape: {pred_masks.shape}, min: {pred_masks.min():.3f}, max: {pred_masks.max():.3f}")
-                    # Check if any masks have significant activation
-                    if pred_masks.dim() >= 3:
-                        mask_maxes = pred_masks.view(pred_masks.shape[0], -1).max(dim=1)[0]
-                        logger.info(f"Per-mask max activations: {mask_maxes[:10]}")  # First 10
+
+                    # Get probabilities from logits
+                    probs = torch.sigmoid(pred_logits[0, :, 0])  # [200] - probability of each mask
+
+                    # Find masks that contain the click point
+                    if point_coords and len(point_coords) > 0:
+                        click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
+                        # Scale click to mask resolution (288x288)
+                        img_h, img_w = image.size[1], image.size[0]  # PIL size is (w, h)
+                        mask_h, mask_w = pred_masks.shape[2], pred_masks.shape[3]
+                        scaled_x = int(click_x * mask_w / img_w)
+                        scaled_y = int(click_y * mask_h / img_h)
+                        logger.info(f"Click ({click_x}, {click_y}) scaled to mask coords ({scaled_x}, {scaled_y})")
+
+                        # Check each mask for click point
+                        best_mask_idx = -1
+                        best_score = 0
+                        for i in range(pred_masks.shape[1]):
+                            mask_logits = pred_masks[0, i]  # [288, 288]
+                            mask_prob = torch.sigmoid(mask_logits)
+                            if 0 <= scaled_y < mask_h and 0 <= scaled_x < mask_w:
+                                point_activation = mask_prob[scaled_y, scaled_x].item()
+                                if point_activation > 0.5:  # Point is inside this mask
+                                    score = probs[i].item() * point_activation
+                                    if score > best_score:
+                                        best_score = score
+                                        best_mask_idx = i
+
+                        if best_mask_idx >= 0:
+                            logger.info(f"Direct extraction: found mask {best_mask_idx} with score {best_score:.3f}")
+                            # Resize mask to original image size
+                            mask_logits = pred_masks[0, best_mask_idx]
+                            mask_prob = torch.sigmoid(mask_logits)
+                            import torch.nn.functional as F
+                            mask_resized = F.interpolate(
+                                mask_prob.unsqueeze(0).unsqueeze(0),
+                                size=(img_h, img_w),
+                                mode='bilinear',
+                                align_corners=False
+                            )[0, 0]
+                            direct_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
+                            logger.info(f"Direct mask has {direct_mask.sum()} pixels")
                 except Exception as e:
                     logger.warning(f"Direct mask extraction failed: {e}")
             logger.info(f"Text detection found {num_masks} mask(s)")
 
-            # NEW: If we have a semantic mask, use it with click-point filtering
+            # Priority 1: Use direct mask if found (bypasses threshold issues)
+            if direct_mask is not None:
+                logger.info(f"Using direct mask extraction result")
+                return {'masks': [direct_mask], 'probs': [0.85]}
+
+            # Priority 2: If we have a semantic mask, use it with click-point filtering
             if semantic_mask is not None and point_coords and len(point_coords) > 0:
                 click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
                 logger.info(f"Using semantic segmentation with click point ({click_x}, {click_y})")
