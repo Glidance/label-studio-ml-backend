@@ -224,15 +224,61 @@ class SAM3Model(LabelStudioMLBase):
             with torch.no_grad():
                 outputs = model(**inputs)
 
-            # Stage 2: Post-process and filter by click point
-            results = processor.post_process_instance_segmentation(
-                outputs,
-                threshold=0.3,  # Lower threshold to catch more candidates
-                mask_threshold=0.5,
-                target_sizes=[list(image.size[::-1])]  # (height, width)
-            )[0]
+            # DEBUG: Log output structure to understand what we're getting
+            logger.info(f"Model outputs type: {type(outputs)}")
+            logger.info(f"Model outputs keys/attrs: {outputs.keys() if hasattr(outputs, 'keys') else dir(outputs)}")
+            if hasattr(outputs, 'pred_masks'):
+                logger.info(f"pred_masks shape: {outputs.pred_masks.shape}")
+            if hasattr(outputs, 'scores'):
+                logger.info(f"scores shape: {outputs.scores.shape}, values: {outputs.scores}")
+            if hasattr(outputs, 'logits'):
+                logger.info(f"logits shape: {outputs.logits.shape}")
+            if hasattr(outputs, 'pred_boxes'):
+                logger.info(f"pred_boxes shape: {outputs.pred_boxes.shape}")
 
-            num_masks = len(results.get('masks', []))
+            # Stage 2: Post-process and filter by click point
+            # Try multiple post-processing approaches
+            results = None
+            num_masks = 0
+
+            # Approach 1: Try post_process_instance_segmentation
+            try:
+                results = processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=0.1,  # Very low threshold to catch more candidates
+                    mask_threshold=0.3,
+                    target_sizes=[list(image.size[::-1])]  # (height, width)
+                )[0]
+                num_masks = len(results.get('masks', []))
+                logger.info(f"post_process_instance_segmentation found {num_masks} mask(s)")
+            except Exception as e:
+                logger.warning(f"post_process_instance_segmentation failed: {e}")
+
+            # Approach 2: Try post_process_semantic_segmentation if instance seg found nothing
+            if num_masks == 0:
+                try:
+                    semantic_results = processor.post_process_semantic_segmentation(
+                        outputs,
+                        target_sizes=[list(image.size[::-1])]
+                    )[0]
+                    logger.info(f"Semantic segmentation result type: {type(semantic_results)}, shape: {semantic_results.shape if hasattr(semantic_results, 'shape') else 'N/A'}")
+                    # Semantic seg returns class labels per pixel - check unique values
+                    if hasattr(semantic_results, 'unique'):
+                        logger.info(f"Unique classes in semantic output: {semantic_results.unique()}")
+                except Exception as e:
+                    logger.warning(f"post_process_semantic_segmentation failed: {e}")
+
+            # Approach 3: Try direct mask extraction if outputs has pred_masks
+            if num_masks == 0 and hasattr(outputs, 'pred_masks'):
+                try:
+                    pred_masks = outputs.pred_masks
+                    logger.info(f"Direct pred_masks - shape: {pred_masks.shape}, min: {pred_masks.min():.3f}, max: {pred_masks.max():.3f}")
+                    # Check if any masks have significant activation
+                    if pred_masks.dim() >= 3:
+                        mask_maxes = pred_masks.view(pred_masks.shape[0], -1).max(dim=1)[0]
+                        logger.info(f"Per-mask max activations: {mask_maxes[:10]}")  # First 10
+                except Exception as e:
+                    logger.warning(f"Direct mask extraction failed: {e}")
             logger.info(f"Text detection found {num_masks} mask(s)")
 
             # Stage 3: Find mask containing user's click point
