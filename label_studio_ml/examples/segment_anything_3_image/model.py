@@ -208,21 +208,21 @@ class SAM3Model(LabelStudioMLBase):
                 outputs = model(**inputs, multimask_output=True)
 
         elif MODEL_TYPE == "sam3":
-            # Sam3Processor format - uses text, points, and boxes
+            # Sam3Processor format - uses text and boxes (NOT points)
             # Use domain-specific prompts for better segmentation accuracy
             text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "navigable surface"
             logger.info(f"Using text prompt: '{text_prompt}' for label: '{label}'")
 
-            input_points_tensor = None
-            input_labels_tensor = None
             input_boxes_tensor = None
             input_boxes_labels = None
 
-            # Add point prompts if provided
+            # Convert point to a small box if provided (Sam3 doesn't support points directly)
             if point_coords and len(point_coords) > 0:
-                input_points_tensor = [[point_coords]]
-                input_labels_tensor = [[point_labels]]
-                logger.info(f"Using points: {point_coords} with labels: {point_labels}")
+                # Create a small box around the point (e.g., 20x20 pixels)
+                px, py = point_coords[0]
+                box_size = 10
+                input_box = [px - box_size, py - box_size, px + box_size, py + box_size]
+                logger.info(f"Converting point ({px}, {py}) to box: {input_box}")
 
             # Add box prompt if provided
             if input_box is not None:
@@ -232,8 +232,6 @@ class SAM3Model(LabelStudioMLBase):
             inputs = processor(
                 images=image,
                 text=text_prompt,
-                input_points=input_points_tensor,
-                input_labels=input_labels_tensor,
                 input_boxes=input_boxes_tensor,
                 input_boxes_labels=input_boxes_labels,
                 return_tensors="pt"
