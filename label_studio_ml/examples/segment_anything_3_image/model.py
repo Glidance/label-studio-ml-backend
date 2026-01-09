@@ -19,6 +19,20 @@ from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_lo
 
 logger = logging.getLogger(__name__)
 
+# Domain-specific prompts for blind navigation robot segmentation
+# These rich descriptions help SAM3's text understanding produce better masks
+# Method 3: Used in COMBINATION with point/box prompts for enhanced accuracy
+DOMAIN_PROMPTS = {
+    "road": "vehicle traffic surface that is dangerous for pedestrian crossing",
+    "paved path": "smooth concrete or asphalt surface safe for walking and mobility devices",
+    "marked crossing": "painted crosswalk or pedestrian crossing area with traffic signals or signs",
+    "unpaved path": "dirt, gravel, or natural surface trail for walking",
+    "driveway": "private vehicle access between road and building, watch for vehicles",
+    "staircase": "steps or stairs requiring careful navigation with handrails",
+    "mixed use": "shared space for pedestrians and vehicles requiring caution",
+    "walkable space": "open area safe for pedestrian movement and navigation",
+}
+
 # Environment configuration
 DEVICE = os.getenv('DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
 MODEL_NAME = os.getenv('MODEL_NAME', 'facebook/sam3')
@@ -194,19 +208,34 @@ class SAM3Model(LabelStudioMLBase):
                 outputs = model(**inputs, multimask_output=True)
 
         elif MODEL_TYPE == "sam3":
-            # Sam3Processor format - uses text and boxes
-            # For boxes: input_boxes = [[box]], input_boxes_labels = [[1]] (1=positive, 0=negative)
-            text_prompt = label if label else "object"
+            # Sam3Processor format - COMBINED text + point/box prompts
+            # This method uses ALL available modalities for maximum accuracy:
+            # 1. Text prompts (domain-specific descriptions)
+            # 2. Point prompts (user clicks)
+            # 3. Box prompts (user rectangles)
+            text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "navigable surface"
+            logger.info(f"Using COMBINED prompting - text: '{text_prompt}', points: {len(point_coords) if point_coords else 0}, box: {input_box is not None}")
+
+            # Prepare point inputs for combined prompting
+            input_points_tensor = None
+            input_labels_tensor = None
+            if point_coords and len(point_coords) > 0:
+                input_points_tensor = [point_coords]
+                input_labels_tensor = [point_labels]
+
+            # Prepare box inputs
             input_boxes_tensor = None
             input_boxes_labels = None
-
             if input_box is not None:
                 input_boxes_tensor = [[input_box]]
                 input_boxes_labels = [[1]]  # Positive box
 
+            # Combined text + spatial prompts for enhanced accuracy
             inputs = processor(
                 images=image,
                 text=text_prompt,
+                input_points=input_points_tensor,
+                input_labels=input_labels_tensor,
                 input_boxes=input_boxes_tensor,
                 input_boxes_labels=input_boxes_labels,
                 return_tensors="pt"

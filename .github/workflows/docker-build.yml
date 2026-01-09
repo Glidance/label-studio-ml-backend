@@ -1,13 +1,13 @@
-name: Build SAM3 Docker Image
+name: Build SAM3 Docker Image - Method 3 (Combined Text + Points)
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - main
-      - feature/sam3-backend
+      - sam3-method3-combined
     paths:
       - 'label_studio_ml/examples/segment_anything_3_image/**'
+      - '.github/workflows/docker-build.yml'
 
 env:
   AWS_REGION: us-east-1
