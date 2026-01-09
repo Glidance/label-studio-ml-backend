@@ -8,6 +8,7 @@ import os
 import logging
 import numpy as np
 import torch
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional
 from uuid import uuid4
 from PIL import Image
@@ -77,6 +78,42 @@ class SAM3Model(LabelStudioMLBase):
     def setup(self):
         """Initialize the model on first request."""
         self.set("model_version", f"sam3-{MODEL_NAME.split('/')[-1]}")
+
+    def get_label_description(self, label: str) -> str:
+        """Extract description attribute from label config XML.
+
+        This method parses the Label Studio label_config XML to find
+        description attributes on Label elements, enabling rich text
+        prompts for SAM3.
+
+        Args:
+            label: The label name to look up
+
+        Returns:
+            The description if found, otherwise the original label name
+        """
+        if not hasattr(self, 'label_config') or not self.label_config:
+            logger.debug("No label_config available, using label as-is")
+            return label
+
+        try:
+            root = ET.fromstring(self.label_config)
+            # Search for Label elements with matching value
+            for label_elem in root.iter('Label'):
+                label_value = label_elem.get('value', '')
+                if label_value.lower() == label.lower():
+                    description = label_elem.get('description')
+                    if description:
+                        logger.info(f"Found description for '{label}': '{description}'")
+                        return description
+            logger.debug(f"No description found for label '{label}'")
+            return label
+        except ET.ParseError as e:
+            logger.warning(f"Failed to parse label_config XML: {e}")
+            return label
+        except Exception as e:
+            logger.warning(f"Error extracting label description: {e}")
+            return label
 
     def get_results(self, masks: List[np.ndarray], probs: List[float],
                     width: int, height: int, from_name: str, to_name: str,
@@ -196,7 +233,9 @@ class SAM3Model(LabelStudioMLBase):
         elif MODEL_TYPE == "sam3":
             # Sam3Processor format - uses text and boxes
             # For boxes: input_boxes = [[box]], input_boxes_labels = [[1]] (1=positive, 0=negative)
-            text_prompt = label if label else "object"
+            # Use label config descriptions for rich text prompts
+            text_prompt = self.get_label_description(label) if label else "object"
+            logger.info(f"Using text prompt: '{text_prompt}' for label: '{label}'")
             input_boxes_tensor = None
             input_boxes_labels = None
 
