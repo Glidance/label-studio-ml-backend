@@ -45,26 +45,27 @@ logger.info(f"Loading model: {MODEL_NAME}")
 processor = None
 model = None
 
-# Try Sam3TrackerProcessor/Model first (supports points and boxes)
+# Method 1: Try Sam3Processor/Model FIRST (supports TEXT prompts + boxes)
+# This is critical for domain-specific text prompting
 try:
-    from transformers import Sam3TrackerProcessor, Sam3TrackerModel
-    processor = Sam3TrackerProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
-    model = Sam3TrackerModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
+    from transformers import Sam3Processor, Sam3Model
+    processor = Sam3Processor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+    model = Sam3Model.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
     model.eval()
-    MODEL_TYPE = "sam3_tracker"
-    logger.info("SAM3 Tracker model loaded successfully")
+    MODEL_TYPE = "sam3"
+    logger.info("SAM3 model (text-capable) loaded successfully")
 except Exception as e:
-    logger.warning(f"Sam3Tracker failed: {e}")
-    # Fallback to Sam3Processor/Model (supports text and boxes)
+    logger.warning(f"Sam3 (text-capable) failed: {e}")
+    # Fallback to Sam3TrackerProcessor/Model (supports points and boxes, NO text)
     try:
-        from transformers import Sam3Processor, Sam3Model
-        processor = Sam3Processor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
-        model = Sam3Model.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
+        from transformers import Sam3TrackerProcessor, Sam3TrackerModel
+        processor = Sam3TrackerProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        model = Sam3TrackerModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
         model.eval()
-        MODEL_TYPE = "sam3"
-        logger.info("SAM3 model loaded successfully")
+        MODEL_TYPE = "sam3_tracker"
+        logger.warning("SAM3 Tracker loaded - TEXT PROMPTS NOT AVAILABLE")
     except Exception as e2:
-        logger.warning(f"Sam3 failed: {e2}")
+        logger.warning(f"Sam3Tracker failed: {e2}")
         # Fallback to AutoModel/AutoProcessor
         try:
             from transformers import AutoProcessor, AutoModel
