@@ -20,16 +20,16 @@ from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_lo
 logger = logging.getLogger(__name__)
 
 # Domain-specific prompts for blind navigation robot segmentation
-# These rich descriptions help SAM3's text understanding produce better masks
+# SAM3 works best with simple noun phrases (not complex descriptions)
 DOMAIN_PROMPTS = {
-    "road": "vehicle traffic surface that is dangerous for pedestrian crossing",
-    "paved path": "smooth concrete or asphalt surface safe for walking and mobility devices",
-    "marked crossing": "painted crosswalk or pedestrian crossing area with traffic signals or signs",
-    "unpaved path": "dirt, gravel, or natural surface trail for walking",
-    "driveway": "private vehicle access between road and building, watch for vehicles",
-    "staircase": "steps or stairs requiring careful navigation with handrails",
-    "mixed use": "shared space for pedestrians and vehicles requiring caution",
-    "walkable space": "open area safe for pedestrian movement and navigation",
+    "road": "road",
+    "paved path": "sidewalk",
+    "marked crossing": "crosswalk",
+    "unpaved path": "dirt path",
+    "driveway": "driveway",
+    "staircase": "stairs",
+    "mixed use": "plaza",
+    "walkable space": "courtyard",
 }
 
 # Environment configuration
@@ -208,13 +208,14 @@ class SAM3Model(LabelStudioMLBase):
                 outputs = model(**inputs, multimask_output=True)
 
         elif MODEL_TYPE == "sam3":
-            # HYBRID TWO-STAGE APPROACH:
-            # Stage 1: Use text prompt to find ALL instances of the concept
-            # Stage 2: Filter by which mask contains the user's click point
-            text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "navigable surface"
-            logger.info(f"Using text prompt: '{text_prompt}' for label: '{label}'")
+            # TEXT-PROMPTED SEGMENTATION WITH PRESENCE-GATED FILTERING
+            # SAM3 returns 200 mask proposals - we filter by presence score and click point
+            import torch.nn.functional as F
 
-            # Stage 1: Text-only inference to find all matching instances
+            text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "surface"
+            logger.info(f"Text prompt: '{text_prompt}' for label: '{label}'")
+
+            # Run text-prompted inference
             inputs = processor(
                 images=image,
                 text=text_prompt,
@@ -224,199 +225,110 @@ class SAM3Model(LabelStudioMLBase):
             with torch.no_grad():
                 outputs = model(**inputs)
 
-            # DEBUG: Log output structure to understand what we're getting
-            logger.info(f"Model outputs type: {type(outputs)}")
-            logger.info(f"Model outputs keys/attrs: {outputs.keys() if hasattr(outputs, 'keys') else dir(outputs)}")
-            if hasattr(outputs, 'pred_masks'):
-                logger.info(f"pred_masks shape: {outputs.pred_masks.shape}")
-            if hasattr(outputs, 'pred_logits'):
-                logits = outputs.pred_logits
-                logger.info(f"pred_logits shape: {logits.shape}")
-                # Apply sigmoid to get probabilities
-                probs = torch.sigmoid(logits[0])  # [200] - one score per mask
-                top_probs, top_indices = probs.topk(min(10, probs.shape[0]))  # Top 10 mask probabilities
-                logger.info(f"Top 10 mask probabilities: {top_probs.tolist()}")
-                logger.info(f"Top 10 mask indices: {top_indices.tolist()}")
-            if hasattr(outputs, 'presence_logits'):
-                presence = torch.sigmoid(outputs.presence_logits)
-                logger.info(f"presence_logits shape: {outputs.presence_logits.shape}, top values: {presence[0, :10].tolist()}")
-            if hasattr(outputs, 'pred_boxes'):
-                logger.info(f"pred_boxes shape: {outputs.pred_boxes.shape}")
+            # Extract outputs
+            pred_masks = outputs.pred_masks[0]  # [200, H, W] - mask proposals
+            pred_logits = torch.sigmoid(outputs.pred_logits[0])  # [200] - per-mask scores
 
-            # Stage 2: Post-process and filter by click point
-            # Try multiple post-processing approaches
-            results = None
-            num_masks = 0
+            # Get presence score (global confidence that the object exists)
+            presence = 1.0  # Default if no presence_logits
+            if hasattr(outputs, 'presence_logits') and outputs.presence_logits is not None:
+                presence = torch.sigmoid(outputs.presence_logits[0, 0]).item()
 
-            # Approach 1: Try post_process_instance_segmentation
-            try:
-                results = processor.post_process_instance_segmentation(
-                    outputs,
-                    threshold=0.1,  # Very low threshold to catch more candidates
-                    mask_threshold=0.3,
-                    target_sizes=[list(image.size[::-1])]  # (height, width)
-                )[0]
-                num_masks = len(results.get('masks', []))
-                logger.info(f"post_process_instance_segmentation found {num_masks} mask(s)")
-            except Exception as e:
-                logger.warning(f"post_process_instance_segmentation failed: {e}")
+            # Compute final scores: pred_logits * presence
+            final_scores = pred_logits * presence  # [200]
 
-            # Approach 2: Use semantic segmentation if instance seg found nothing
-            semantic_mask = None
-            if num_masks == 0:
-                try:
-                    semantic_results = processor.post_process_semantic_segmentation(
-                        outputs,
-                        target_sizes=[list(image.size[::-1])]
-                    )[0]
-                    logger.info(f"Semantic segmentation result type: {type(semantic_results)}, shape: {semantic_results.shape if hasattr(semantic_results, 'shape') else 'N/A'}")
-                    # Semantic seg returns class labels per pixel - check unique values
-                    if hasattr(semantic_results, 'unique'):
-                        unique_classes = semantic_results.unique()
-                        logger.info(f"Unique classes in semantic output: {unique_classes}")
-                        # Class 1 is typically the positive detection (class 0 is background)
-                        if len(unique_classes) > 1:
-                            # Create binary mask where class > 0
-                            semantic_mask = (semantic_results > 0).cpu().numpy().astype(np.uint8)
-                            logger.info(f"Created semantic mask with {semantic_mask.sum()} positive pixels")
-                except Exception as e:
-                    logger.warning(f"post_process_semantic_segmentation failed: {e}")
+            # Use low threshold since presence can be low (0.03-0.10)
+            threshold = 0.05
+            keep_indices = torch.where(final_scores > threshold)[0]
 
-            # Approach 3: Try direct mask extraction using pred_masks + pred_logits
-            direct_mask = None
-            if num_masks == 0 and semantic_mask is None and hasattr(outputs, 'pred_masks') and hasattr(outputs, 'pred_logits'):
-                try:
-                    pred_masks = outputs.pred_masks  # [1, 200, 288, 288]
-                    pred_logits = outputs.pred_logits  # [1, 200]
-                    logger.info(f"Direct pred_masks - shape: {pred_masks.shape}, min: {pred_masks.min():.3f}, max: {pred_masks.max():.3f}")
+            logger.info(f"Presence: {presence:.3f}, kept {len(keep_indices)}/{len(final_scores)} masks above threshold {threshold}")
+            if len(keep_indices) > 0:
+                top_scores = final_scores[keep_indices][:10]
+                logger.info(f"Top filtered scores: {top_scores.tolist()}")
 
-                    # Get probabilities from logits
-                    probs = torch.sigmoid(pred_logits[0])  # [200] - probability of each mask
+            # Get image dimensions
+            img_w, img_h = image.size  # PIL size is (width, height)
+            mask_h, mask_w = pred_masks.shape[1], pred_masks.shape[2]
 
-                    # Find masks that contain the click point
-                    if point_coords and len(point_coords) > 0:
-                        click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
-                        # Scale click to mask resolution (288x288)
-                        img_h, img_w = image.size[1], image.size[0]  # PIL size is (w, h)
-                        mask_h, mask_w = pred_masks.shape[2], pred_masks.shape[3]
-                        scaled_x = int(click_x * mask_w / img_w)
-                        scaled_y = int(click_y * mask_h / img_h)
-                        logger.info(f"Click ({click_x}, {click_y}) scaled to mask coords ({scaled_x}, {scaled_y})")
-
-                        # Check each mask for click point
-                        best_mask_idx = -1
-                        best_score = 0
-                        for i in range(pred_masks.shape[1]):
-                            mask_logits = pred_masks[0, i]  # [288, 288]
-                            mask_prob = torch.sigmoid(mask_logits)
-                            if 0 <= scaled_y < mask_h and 0 <= scaled_x < mask_w:
-                                point_activation = mask_prob[scaled_y, scaled_x].item()
-                                if point_activation > 0.5:  # Point is inside this mask
-                                    score = probs[i].item() * point_activation
-                                    if score > best_score:
-                                        best_score = score
-                                        best_mask_idx = i
-
-                        if best_mask_idx >= 0:
-                            logger.info(f"Direct extraction: found mask {best_mask_idx} with score {best_score:.3f}")
-                            # Resize mask to original image size
-                            mask_logits = pred_masks[0, best_mask_idx]
-                            mask_prob = torch.sigmoid(mask_logits)
-                            import torch.nn.functional as F
-                            mask_resized = F.interpolate(
-                                mask_prob.unsqueeze(0).unsqueeze(0),
-                                size=(img_h, img_w),
-                                mode='bilinear',
-                                align_corners=False
-                            )[0, 0]
-                            direct_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
-                            logger.info(f"Direct mask has {direct_mask.sum()} pixels")
-                except Exception as e:
-                    logger.warning(f"Direct mask extraction failed: {e}")
-            logger.info(f"Text detection found {num_masks} mask(s)")
-
-            # Priority 1: Use direct mask if found (bypasses threshold issues)
-            if direct_mask is not None:
-                logger.info(f"Using direct mask extraction result")
-                return {'masks': [direct_mask], 'probs': [0.85]}
-
-            # Priority 2: If we have a semantic mask, use it with click-point filtering
-            if semantic_mask is not None and point_coords and len(point_coords) > 0:
+            # Find best mask containing the click point
+            if len(keep_indices) > 0 and point_coords and len(point_coords) > 0:
                 click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
-                logger.info(f"Using semantic segmentation with click point ({click_x}, {click_y})")
 
-                # Check if click is in the semantic mask
-                if 0 <= click_y < semantic_mask.shape[0] and 0 <= click_x < semantic_mask.shape[1]:
-                    if semantic_mask[click_y, click_x] > 0:
-                        # Use flood fill to get connected component containing the click
-                        # This avoids scipy dependency
-                        import cv2
-                        # Create a copy for flood fill (needs to be larger by 2 pixels in each dimension)
-                        h, w = semantic_mask.shape
-                        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-                        # Flood fill from click point
-                        cv2.floodFill(semantic_mask.copy(), flood_mask, (click_x, click_y), 255)
-                        # Extract the filled region (remove the 1-pixel border)
-                        component_mask = flood_mask[1:-1, 1:-1]
-                        num_pixels = component_mask.sum() // 255
-                        logger.info(f"Flood fill from ({click_x}, {click_y}) found {num_pixels} pixels")
+                # Scale click to mask resolution
+                scaled_x = int(click_x * mask_w / img_w)
+                scaled_y = int(click_y * mask_h / img_h)
+                scaled_x = max(0, min(scaled_x, mask_w - 1))
+                scaled_y = max(0, min(scaled_y, mask_h - 1))
 
-                        if num_pixels > 0:
-                            # Normalize to 0-1
-                            component_mask = (component_mask > 0).astype(np.uint8)
-                            logger.info(f"Returning connected component with {component_mask.sum()} pixels")
-                            return {'masks': [component_mask], 'probs': [0.8]}
-                        else:
-                            # Fallback to full semantic mask
-                            logger.warning("Flood fill returned empty, using full semantic mask")
-                            return {'masks': [semantic_mask], 'probs': [0.7]}
-                    else:
-                        logger.warning(f"Click point ({click_x}, {click_y}) is not in semantic mask, returning full mask")
-                        return {'masks': [semantic_mask], 'probs': [0.6]}
-                else:
-                    logger.warning(f"Click point ({click_x}, {click_y}) out of bounds for mask {semantic_mask.shape}")
-                    return {'masks': [semantic_mask], 'probs': [0.5]}
+                logger.info(f"Click ({click_x}, {click_y}) -> mask coords ({scaled_x}, {scaled_y})")
 
-            # Stage 3: Find mask containing user's click point
-            if num_masks > 0 and point_coords and len(point_coords) > 0:
-                click_x, click_y = point_coords[0]
-                logger.info(f"Filtering {num_masks} masks by click point ({click_x}, {click_y})")
+                best_idx = -1
+                best_score = 0.0
 
-                best_mask = None
-                best_score = 0
+                for idx in keep_indices:
+                    idx = idx.item()
+                    mask_prob = torch.sigmoid(pred_masks[idx])
 
-                for i, mask in enumerate(results['masks']):
-                    mask_np = mask.cpu().numpy().astype(np.uint8)
                     # Check if click point is inside this mask
-                    if 0 <= click_y < mask_np.shape[0] and 0 <= click_x < mask_np.shape[1]:
-                        if mask_np[click_y, click_x] > 0:
-                            score = float(results['scores'][i].cpu().numpy())
-                            logger.info(f"  Mask {i}: contains click, score={score:.3f}")
-                            if score > best_score:
-                                best_mask = mask_np
-                                best_score = score
+                    point_activation = mask_prob[scaled_y, scaled_x].item()
+                    if point_activation > 0.5:
+                        score = final_scores[idx].item()
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
 
-                if best_mask is not None:
-                    logger.info(f"Selected mask with score {best_score:.3f}")
-                    return {'masks': [best_mask], 'probs': [best_score]}
+                if best_idx >= 0:
+                    logger.info(f"Found mask {best_idx} containing click, score={best_score:.3f}")
+
+                    # Resize mask to original image size
+                    mask_prob = torch.sigmoid(pred_masks[best_idx])
+                    mask_resized = F.interpolate(
+                        mask_prob.unsqueeze(0).unsqueeze(0),
+                        size=(img_h, img_w),
+                        mode='bilinear',
+                        align_corners=False
+                    )[0, 0]
+
+                    final_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
+                    logger.info(f"Returning mask with {final_mask.sum()} pixels")
+                    return {'masks': [final_mask], 'probs': [best_score]}
                 else:
-                    logger.warning(f"No mask contains click point ({click_x}, {click_y}), returning highest-scoring mask")
-                    # Fallback: return highest scoring mask
-                    best_idx = int(torch.argmax(results['scores']))
-                    best_mask = results['masks'][best_idx].cpu().numpy().astype(np.uint8)
-                    best_prob = float(results['scores'][best_idx].cpu().numpy())
-                    return {'masks': [best_mask], 'probs': [best_prob]}
+                    # No mask contains click - try highest scoring mask anyway
+                    logger.warning(f"No mask contains click point, trying highest scoring mask")
+                    best_idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
+                    best_score = final_scores[best_idx].item()
 
-            elif num_masks > 0:
-                # No point provided - return best mask
-                logger.info("No click point provided, returning highest-scoring mask")
-                best_idx = int(torch.argmax(results['scores']))
-                best_mask = results['masks'][best_idx].cpu().numpy().astype(np.uint8)
-                best_prob = float(results['scores'][best_idx].cpu().numpy())
-                return {'masks': [best_mask], 'probs': [best_prob]}
+                    mask_prob = torch.sigmoid(pred_masks[best_idx])
+                    mask_resized = F.interpolate(
+                        mask_prob.unsqueeze(0).unsqueeze(0),
+                        size=(img_h, img_w),
+                        mode='bilinear',
+                        align_corners=False
+                    )[0, 0]
+
+                    final_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
+                    logger.info(f"Returning highest-scoring mask {best_idx} with {final_mask.sum()} pixels")
+                    return {'masks': [final_mask], 'probs': [best_score]}
+
+            elif len(keep_indices) > 0:
+                # No click point - return highest scoring mask
+                best_idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
+                best_score = final_scores[best_idx].item()
+                logger.info(f"No click point, using highest-scoring mask {best_idx}")
+
+                mask_prob = torch.sigmoid(pred_masks[best_idx])
+                mask_resized = F.interpolate(
+                    mask_prob.unsqueeze(0).unsqueeze(0),
+                    size=(img_h, img_w),
+                    mode='bilinear',
+                    align_corners=False
+                )[0, 0]
+
+                final_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
+                return {'masks': [final_mask], 'probs': [best_score]}
 
             else:
-                logger.warning("No masks found by text detection")
+                logger.warning(f"No masks above threshold {threshold}")
                 return {'masks': [], 'probs': []}
 
         else:
