@@ -77,9 +77,11 @@ DOMAIN_PROMPTS = {
 DEVICE = os.getenv('DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
 MODEL_NAME = os.getenv('MODEL_NAME', 'facebook/sam3')
 HF_TOKEN = os.getenv('HF_TOKEN', os.getenv('HUGGING_FACE_HUB_TOKEN', None))
+MASK_THRESHOLD = float(os.getenv('MASK_THRESHOLD', '0.5'))  # Higher = tighter masks
 
 logger.info(f"Using device: {DEVICE}")
 logger.info(f"Loading model: {MODEL_NAME}")
+logger.info(f"Mask threshold: {MASK_THRESHOLD} (higher = tighter masks)")
 
 # Initialize model and processor
 # Try multiple model/processor combinations for compatibility
@@ -325,7 +327,7 @@ class SAM3Model(LabelStudioMLBase):
                                     mode='bilinear',
                                     align_corners=False
                                 )[0, 0]
-                                best_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
+                                best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
                 else:
                     # No click point - use highest scoring mask for this prompt
                     idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
@@ -340,7 +342,7 @@ class SAM3Model(LabelStudioMLBase):
                             mode='bilinear',
                             align_corners=False
                         )[0, 0]
-                        best_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
+                        best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
 
             if best_mask is not None:
                 logger.info(f"Best result: prompt='{best_prompt}', score={best_score:.3f}, pixels={best_mask.sum()}")
