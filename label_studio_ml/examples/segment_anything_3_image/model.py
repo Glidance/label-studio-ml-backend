@@ -232,9 +232,9 @@ class SAM3Model(LabelStudioMLBase):
             if hasattr(outputs, 'pred_logits'):
                 logits = outputs.pred_logits
                 logger.info(f"pred_logits shape: {logits.shape}")
-                # Apply softmax/sigmoid to get probabilities
-                probs = torch.sigmoid(logits)
-                top_probs, top_indices = probs[0, :, 0].topk(10)  # Top 10 mask probabilities
+                # Apply sigmoid to get probabilities
+                probs = torch.sigmoid(logits[0])  # [200] - one score per mask
+                top_probs, top_indices = probs.topk(min(10, probs.shape[0]))  # Top 10 mask probabilities
                 logger.info(f"Top 10 mask probabilities: {top_probs.tolist()}")
                 logger.info(f"Top 10 mask indices: {top_indices.tolist()}")
             if hasattr(outputs, 'presence_logits'):
@@ -287,11 +287,11 @@ class SAM3Model(LabelStudioMLBase):
             if num_masks == 0 and semantic_mask is None and hasattr(outputs, 'pred_masks') and hasattr(outputs, 'pred_logits'):
                 try:
                     pred_masks = outputs.pred_masks  # [1, 200, 288, 288]
-                    pred_logits = outputs.pred_logits  # [1, 200, num_classes]
+                    pred_logits = outputs.pred_logits  # [1, 200]
                     logger.info(f"Direct pred_masks - shape: {pred_masks.shape}, min: {pred_masks.min():.3f}, max: {pred_masks.max():.3f}")
 
                     # Get probabilities from logits
-                    probs = torch.sigmoid(pred_logits[0, :, 0])  # [200] - probability of each mask
+                    probs = torch.sigmoid(pred_logits[0])  # [200] - probability of each mask
 
                     # Find masks that contain the click point
                     if point_coords and len(point_coords) > 0:
