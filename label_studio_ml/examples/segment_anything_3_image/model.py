@@ -296,17 +296,28 @@ class SAM3Model(LabelStudioMLBase):
                 # Check if click is in the semantic mask
                 if 0 <= click_y < semantic_mask.shape[0] and 0 <= click_x < semantic_mask.shape[1]:
                     if semantic_mask[click_y, click_x] > 0:
-                        # Use connected component analysis to get only the region containing the click
-                        from scipy import ndimage
-                        labeled_mask, num_features = ndimage.label(semantic_mask)
-                        click_label = labeled_mask[click_y, click_x]
-                        logger.info(f"Found {num_features} connected components, click is in component {click_label}")
+                        # Use flood fill to get connected component containing the click
+                        # This avoids scipy dependency
+                        import cv2
+                        # Create a copy for flood fill (needs to be larger by 2 pixels in each dimension)
+                        h, w = semantic_mask.shape
+                        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                        # Flood fill from click point
+                        cv2.floodFill(semantic_mask.copy(), flood_mask, (click_x, click_y), 255)
+                        # Extract the filled region (remove the 1-pixel border)
+                        component_mask = flood_mask[1:-1, 1:-1]
+                        num_pixels = component_mask.sum() // 255
+                        logger.info(f"Flood fill from ({click_x}, {click_y}) found {num_pixels} pixels")
 
-                        if click_label > 0:
-                            # Extract just the connected component containing the click
-                            component_mask = (labeled_mask == click_label).astype(np.uint8)
+                        if num_pixels > 0:
+                            # Normalize to 0-1
+                            component_mask = (component_mask > 0).astype(np.uint8)
                             logger.info(f"Returning connected component with {component_mask.sum()} pixels")
-                            return {'masks': [component_mask], 'probs': [0.8]}  # Confidence score
+                            return {'masks': [component_mask], 'probs': [0.8]}
+                        else:
+                            # Fallback to full semantic mask
+                            logger.warning("Flood fill returned empty, using full semantic mask")
+                            return {'masks': [semantic_mask], 'probs': [0.7]}
                     else:
                         logger.warning(f"Click point ({click_x}, {click_y}) is not in semantic mask, returning full mask")
                         return {'masks': [semantic_mask], 'probs': [0.6]}
