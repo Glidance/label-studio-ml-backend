@@ -11,6 +11,7 @@ import torch
 from typing import List, Dict, Optional
 from uuid import uuid4
 from PIL import Image
+import cv2
 
 from label_studio_ml.model import LabelStudioMLBase
 from label_studio_ml.response import ModelResponse
@@ -261,10 +262,37 @@ class SAM3Model(LabelStudioMLBase):
 
         logger.info(f"Point-only fallback: mask with score {best_prob:.3f}")
 
+        # Apply post-processing to clean up the mask
+        best_mask = self._postprocess_mask(best_mask)
+
         return {
             'masks': [best_mask],
             'probs': [best_prob]
         }
+
+    def _postprocess_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Clean up mask with morphological operations.
+
+        Applies:
+        1. Closing - fills small holes inside the mask
+        2. Opening - removes small noise/fragments
+        3. Connected components - removes tiny disconnected regions
+        """
+        kernel = np.ones((5, 5), np.uint8)
+
+        # Fill small holes
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # Remove small noise/fragments
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # Remove small disconnected regions (< 500 pixels)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] < 500:
+                mask[labels == i] = 0
+
+        return mask
 
     def _sam_predict(self, img_url: str, point_coords: Optional[List] = None,
                      point_labels: Optional[List] = None, input_box: Optional[List] = None,
@@ -423,6 +451,9 @@ class SAM3Model(LabelStudioMLBase):
                 else:
                     logger.warning(f"No masks found and no click point for fallback")
                     return {'masks': [], 'probs': []}
+
+            # Apply post-processing to clean up the mask
+            best_mask = self._postprocess_mask(best_mask)
 
             logger.info(f"Best result: prompt='{best_prompt}', score={best_score:.3f}, pixels={best_mask.sum()}")
             return {'masks': [best_mask], 'probs': [best_score]}
