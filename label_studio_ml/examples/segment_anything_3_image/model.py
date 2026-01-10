@@ -20,25 +20,70 @@ from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_lo
 logger = logging.getLogger(__name__)
 
 # Domain-specific prompts for blind navigation robot segmentation
-# SAM3 works best with simple noun phrases (not complex descriptions)
+# SAM3 likes short noun phrases (concepts). Use 1-4 prompts per class.
+# Method 4+6 Hybrid: Multi-prompt ensemble with point-only fallback
 DOMAIN_PROMPTS = {
-    "road": "road",
-    "paved path": "sidewalk",
-    "marked crossing": "crosswalk",
-    "unpaved path": "dirt path",
-    "driveway": "driveway",
-    "staircase": "stairs",
-    "mixed use": "plaza",
-    "walkable space": "courtyard",
+    "road": [
+        "roadway",
+        "street",
+        "driving lane",
+        "carriageway",
+    ],
+    "paved path": [
+        "sidewalk",
+        "paved footpath",
+        "pedestrian walkway",
+        "paved path",
+    ],
+    "marked crossing": [
+        "crosswalk",
+        "pedestrian crossing",
+        "zebra crossing",
+        "painted crossing markings",
+    ],
+    "unpaved path": [
+        "trail",
+        "dirt path",
+        "gravel path",
+        "unpaved footpath",
+    ],
+    "driveway": [
+        "driveway",
+        "vehicle entrance",
+        "garage approach",
+        "parking access lane",
+    ],
+    "staircase": [
+        "stairs",
+        "staircase",
+        "steps",
+        "stairwell",
+    ],
+    "mixed use": [
+        "shared space",
+        "shared street",
+        "pedestrian and vehicle shared area",
+        "plaza with traffic access",
+    ],
+    "walkable space": [
+        "pedestrian area",
+        "walkable open space",
+        "courtyard",
+        "public square",
+    ],
 }
 
 # Environment configuration
 DEVICE = os.getenv('DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
 MODEL_NAME = os.getenv('MODEL_NAME', 'facebook/sam3')
 HF_TOKEN = os.getenv('HF_TOKEN', os.getenv('HUGGING_FACE_HUB_TOKEN', None))
+MASK_THRESHOLD = float(os.getenv('MASK_THRESHOLD', '0.5'))  # Higher = tighter masks
+PRESENCE_THRESHOLD = float(os.getenv('PRESENCE_THRESHOLD', '0.5'))  # Below this, fall back to point-only
 
 logger.info(f"Using device: {DEVICE}")
 logger.info(f"Loading model: {MODEL_NAME}")
+logger.info(f"Mask threshold: {MASK_THRESHOLD} (higher = tighter masks)")
+logger.info(f"Presence threshold: {PRESENCE_THRESHOLD} (below = fallback to point-only)")
 
 # Initialize models and processors
 # Method 4 (Hybrid): Load BOTH text-capable and point-only models for fallback
@@ -273,134 +318,114 @@ class SAM3Model(LabelStudioMLBase):
                 outputs = model(**inputs, multimask_output=True)
 
         elif MODEL_TYPE == "sam3":
-            # TEXT-PROMPTED SEGMENTATION WITH PRESENCE-GATED FILTERING
-            # SAM3 returns 200 mask proposals - we filter by presence score and click point
+            # METHOD 4+6 HYBRID: MULTI-PROMPT ENSEMBLE WITH POINT-ONLY FALLBACK
+            # Try all prompts for a label, pick the best result
+            # If no prompt has good presence, fall back to point-only
             import torch.nn.functional as F
 
-            text_prompt = DOMAIN_PROMPTS.get(label.lower(), label) if label else "surface"
-            logger.info(f"Text prompt: '{text_prompt}' for label: '{label}'")
+            # Get list of prompts for this label
+            prompts = DOMAIN_PROMPTS.get(label.lower(), [label]) if label else ["surface"]
+            if isinstance(prompts, str):
+                prompts = [prompts]  # Handle legacy single-string prompts
 
-            # Run text-prompted inference
-            inputs = processor(
-                images=image,
-                text=text_prompt,
-                return_tensors="pt"
-            ).to(DEVICE)
-
-            with torch.no_grad():
-                outputs = model(**inputs)
-
-            # Extract outputs
-            pred_masks = outputs.pred_masks[0]  # [200, H, W] - mask proposals
-            pred_logits = torch.sigmoid(outputs.pred_logits[0])  # [200] - per-mask scores
-
-            # Get presence score (global confidence that the object exists)
-            presence = 1.0  # Default if no presence_logits
-            if hasattr(outputs, 'presence_logits') and outputs.presence_logits is not None:
-                presence = torch.sigmoid(outputs.presence_logits[0, 0]).item()
-
-            # METHOD 4 HYBRID: Fall back to point-only if text confidence is low
-            PRESENCE_THRESHOLD = 0.5
-            if presence < PRESENCE_THRESHOLD and point_coords and len(point_coords) > 0:
-                logger.info(f"Presence {presence:.3f} < {PRESENCE_THRESHOLD}, falling back to point-only")
-                return self._point_only_predict(image, point_coords, point_labels or [1] * len(point_coords))
-
-            # Compute final scores: pred_logits * presence
-            final_scores = pred_logits * presence  # [200]
-
-            # Use low threshold since presence can be low (0.03-0.10)
-            threshold = 0.05
-            keep_indices = torch.where(final_scores > threshold)[0]
-
-            logger.info(f"Presence: {presence:.3f} (above threshold), kept {len(keep_indices)}/{len(final_scores)} masks")
-            if len(keep_indices) > 0:
-                top_scores = final_scores[keep_indices][:10]
-                logger.info(f"Top filtered scores: {top_scores.tolist()}")
+            logger.info(f"Multi-prompt ensemble: trying {len(prompts)} prompts for label '{label}'")
 
             # Get image dimensions
-            img_w, img_h = image.size  # PIL size is (width, height)
-            mask_h, mask_w = pred_masks.shape[1], pred_masks.shape[2]
+            img_w, img_h = image.size
 
-            # Find best mask containing the click point
-            if len(keep_indices) > 0 and point_coords and len(point_coords) > 0:
-                click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
+            # Track best result across all prompts
+            best_mask = None
+            best_score = 0.0
+            best_prompt = None
+            max_presence = 0.0  # Track highest presence across all prompts
 
-                # Scale click to mask resolution
-                scaled_x = int(click_x * mask_w / img_w)
-                scaled_y = int(click_y * mask_h / img_h)
-                scaled_x = max(0, min(scaled_x, mask_w - 1))
-                scaled_y = max(0, min(scaled_y, mask_h - 1))
+            for text_prompt in prompts:
+                logger.info(f"  Trying prompt: '{text_prompt}'")
 
-                logger.info(f"Click ({click_x}, {click_y}) -> mask coords ({scaled_x}, {scaled_y})")
+                # Run text-prompted inference
+                inputs = processor(
+                    images=image,
+                    text=text_prompt,
+                    return_tensors="pt"
+                ).to(DEVICE)
 
-                best_idx = -1
-                best_score = 0.0
+                with torch.no_grad():
+                    outputs = model(**inputs)
 
-                for idx in keep_indices:
-                    idx = idx.item()
-                    mask_prob = torch.sigmoid(pred_masks[idx])
+                # Extract outputs
+                pred_masks = outputs.pred_masks[0]  # [200, H, W]
+                pred_logits = torch.sigmoid(outputs.pred_logits[0])  # [200]
 
-                    # Check if click point is inside this mask
-                    point_activation = mask_prob[scaled_y, scaled_x].item()
-                    if point_activation > 0.5:
-                        score = final_scores[idx].item()
-                        if score > best_score:
-                            best_score = score
-                            best_idx = idx
+                # Get presence score
+                presence = 1.0
+                if hasattr(outputs, 'presence_logits') and outputs.presence_logits is not None:
+                    presence = torch.sigmoid(outputs.presence_logits[0, 0]).item()
 
-                if best_idx >= 0:
-                    logger.info(f"Found mask {best_idx} containing click, score={best_score:.3f}")
+                max_presence = max(max_presence, presence)
 
-                    # Resize mask to original image size
-                    mask_prob = torch.sigmoid(pred_masks[best_idx])
-                    mask_resized = F.interpolate(
-                        mask_prob.unsqueeze(0).unsqueeze(0),
-                        size=(img_h, img_w),
-                        mode='bilinear',
-                        align_corners=False
-                    )[0, 0]
+                # Compute final scores
+                final_scores = pred_logits * presence
+                threshold = 0.05
+                keep_indices = torch.where(final_scores > threshold)[0]
 
-                    final_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
-                    logger.info(f"Returning mask with {final_mask.sum()} pixels")
-                    return {'masks': [final_mask], 'probs': [best_score]}
+                logger.info(f"    Presence: {presence:.3f}, kept {len(keep_indices)} masks")
+
+                if len(keep_indices) == 0:
+                    continue
+
+                mask_h, mask_w = pred_masks.shape[1], pred_masks.shape[2]
+
+                # Find mask containing click point (if provided)
+                if point_coords and len(point_coords) > 0:
+                    click_x, click_y = int(point_coords[0][0]), int(point_coords[0][1])
+                    scaled_x = max(0, min(int(click_x * mask_w / img_w), mask_w - 1))
+                    scaled_y = max(0, min(int(click_y * mask_h / img_h), mask_h - 1))
+
+                    for idx in keep_indices:
+                        idx = idx.item()
+                        mask_prob = torch.sigmoid(pred_masks[idx])
+                        point_activation = mask_prob[scaled_y, scaled_x].item()
+
+                        if point_activation > 0.5:
+                            score = final_scores[idx].item()
+                            if score > best_score:
+                                best_score = score
+                                best_prompt = text_prompt
+                                # Resize and store mask
+                                mask_resized = F.interpolate(
+                                    mask_prob.unsqueeze(0).unsqueeze(0),
+                                    size=(img_h, img_w),
+                                    mode='bilinear',
+                                    align_corners=False
+                                )[0, 0]
+                                best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
                 else:
-                    # No mask contains click - try highest scoring mask anyway
-                    logger.warning(f"No mask contains click point, trying highest scoring mask")
-                    best_idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
-                    best_score = final_scores[best_idx].item()
+                    # No click point - use highest scoring mask for this prompt
+                    idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
+                    score = final_scores[idx].item()
+                    if score > best_score:
+                        best_score = score
+                        best_prompt = text_prompt
+                        mask_prob = torch.sigmoid(pred_masks[idx])
+                        mask_resized = F.interpolate(
+                            mask_prob.unsqueeze(0).unsqueeze(0),
+                            size=(img_h, img_w),
+                            mode='bilinear',
+                            align_corners=False
+                        )[0, 0]
+                        best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
 
-                    mask_prob = torch.sigmoid(pred_masks[best_idx])
-                    mask_resized = F.interpolate(
-                        mask_prob.unsqueeze(0).unsqueeze(0),
-                        size=(img_h, img_w),
-                        mode='bilinear',
-                        align_corners=False
-                    )[0, 0]
+            # METHOD 4 FALLBACK: If no good result from any prompt, fall back to point-only
+            if best_mask is None or max_presence < PRESENCE_THRESHOLD:
+                if point_coords and len(point_coords) > 0:
+                    logger.info(f"Max presence {max_presence:.3f} < {PRESENCE_THRESHOLD} or no mask found, falling back to point-only")
+                    return self._point_only_predict(image, point_coords, point_labels or [1] * len(point_coords))
+                else:
+                    logger.warning(f"No masks found and no click point for fallback")
+                    return {'masks': [], 'probs': []}
 
-                    final_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
-                    logger.info(f"Returning highest-scoring mask {best_idx} with {final_mask.sum()} pixels")
-                    return {'masks': [final_mask], 'probs': [best_score]}
-
-            elif len(keep_indices) > 0:
-                # No click point - return highest scoring mask
-                best_idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
-                best_score = final_scores[best_idx].item()
-                logger.info(f"No click point, using highest-scoring mask {best_idx}")
-
-                mask_prob = torch.sigmoid(pred_masks[best_idx])
-                mask_resized = F.interpolate(
-                    mask_prob.unsqueeze(0).unsqueeze(0),
-                    size=(img_h, img_w),
-                    mode='bilinear',
-                    align_corners=False
-                )[0, 0]
-
-                final_mask = (mask_resized > 0.5).cpu().numpy().astype(np.uint8)
-                return {'masks': [final_mask], 'probs': [best_score]}
-
-            else:
-                logger.warning(f"No masks above threshold {threshold}")
-                return {'masks': [], 'probs': []}
+            logger.info(f"Best result: prompt='{best_prompt}', score={best_score:.3f}, pixels={best_mask.sum()}")
+            return {'masks': [best_mask], 'probs': [best_score]}
 
         else:
             # Generic AutoModel fallback
