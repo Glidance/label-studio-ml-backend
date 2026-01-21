@@ -84,6 +84,10 @@ PRESENCE_THRESHOLD = float(os.getenv('PRESENCE_THRESHOLD', '0.5'))  # Below this
 # Example: SAM3_BATCH_LABELS="road,paved path,marked crossing,unpaved path,driveway"
 BATCH_LABELS = os.getenv('SAM3_BATCH_LABELS', '')
 
+# Minimum confidence score for batch predictions (0.0-1.0)
+# Predictions below this threshold will be excluded
+BATCH_MIN_SCORE = float(os.getenv('SAM3_BATCH_MIN_SCORE', '0.51'))
+
 logger.info(f"Using device: {DEVICE}")
 logger.info(f"Loading model: {MODEL_NAME}")
 logger.info(f"Mask threshold: {MASK_THRESHOLD} (higher = tighter masks)")
@@ -580,6 +584,11 @@ class SAM3Model(LabelStudioMLBase):
                             best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
 
                     if best_mask is not None:
+                        # Filter by minimum confidence threshold
+                        if best_score < BATCH_MIN_SCORE:
+                            logger.info(f"  Skipping '{label}' - score {best_score:.3f} < threshold {BATCH_MIN_SCORE}")
+                            continue
+
                         label_id = str(uuid4())[:4]
                         mask_uint8 = (best_mask * 255).astype(np.uint8)
                         rle = brush.mask2rle(mask_uint8)
@@ -600,7 +609,7 @@ class SAM3Model(LabelStudioMLBase):
                             'type': 'brushlabels',
                             'readonly': False
                         })
-                        logger.info(f"  Found '{label}' with score {best_score:.3f}")
+                        logger.info(f"  Found '{label}' with score {best_score:.3f} (threshold: {BATCH_MIN_SCORE})")
 
                 if task_results:
                     all_predictions.append({
