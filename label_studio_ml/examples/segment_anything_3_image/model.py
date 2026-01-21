@@ -80,6 +80,10 @@ HF_TOKEN = os.getenv('HF_TOKEN', os.getenv('HUGGING_FACE_HUB_TOKEN', None))
 MASK_THRESHOLD = float(os.getenv('MASK_THRESHOLD', '0.5'))  # Higher = tighter masks
 PRESENCE_THRESHOLD = float(os.getenv('PRESENCE_THRESHOLD', '0.5'))  # Below this, fall back to point-only
 
+# Batch prediction labels - comma-separated list of labels to auto-segment on import
+# Example: SAM3_BATCH_LABELS="road,paved path,marked crossing,unpaved path,driveway"
+BATCH_LABELS = os.getenv('SAM3_BATCH_LABELS', '')
+
 logger.info(f"Using device: {DEVICE}")
 logger.info(f"Loading model: {MODEL_NAME}")
 logger.info(f"Mask threshold: {MASK_THRESHOLD} (higher = tighter masks)")
@@ -206,8 +210,22 @@ class SAM3Model(LabelStudioMLBase):
 
         Returns:
             PIL Image in RGB format
+
+        Supports:
+        - file:// URLs (local files)
+        - Absolute paths starting with /
+        - HTTP/HTTPS URLs (via Label Studio SDK)
         """
-        image_path = get_local_path(image_url, task_id=task_id)
+        # Handle file:// URLs
+        if image_url.startswith('file://'):
+            image_path = image_url[7:]  # Remove 'file://' prefix
+        # Handle absolute local paths
+        elif image_url.startswith('/'):
+            image_path = image_url
+        else:
+            # Use Label Studio SDK for remote URLs
+            image_path = get_local_path(image_url, task_id=task_id)
+
         image = Image.open(image_path).convert("RGB")
         return image
 
@@ -468,26 +486,171 @@ class SAM3Model(LabelStudioMLBase):
             'probs': [best_prob]
         }
 
+    def _batch_predict(self, tasks: List[Dict], labels: List[str],
+                        from_name: str, to_name: str, value: str) -> ModelResponse:
+        """Run batch predictions for all specified labels without user interaction.
+
+        This enables automatic segmentation when new images are imported,
+        using the domain-specific prompts for each configured label.
+
+        Args:
+            tasks: List of Label Studio tasks to process
+            labels: List of label names to segment (e.g., ["road", "paved path"])
+            from_name: The from_name from label config
+            to_name: The to_name from label config
+            value: The data key for the image URL
+
+        Returns:
+            ModelResponse with predictions for all tasks and labels
+        """
+        if MODEL_TYPE != "sam3":
+            logger.error("Batch prediction requires Sam3Model with text prompts")
+            return ModelResponse(predictions=[])
+
+        import torch.nn.functional as F
+        all_predictions = []
+
+        for task in tasks:
+            task_id = task.get('id')
+            img_url = task['data'].get(value)
+
+            if not img_url:
+                logger.warning(f"Task {task_id} has no image at '{value}'")
+                continue
+
+            try:
+                image = self.load_image(img_url, task_id)
+                img_w, img_h = image.size
+
+                task_results = []
+
+                for label in labels:
+                    label = label.strip()
+                    if not label:
+                        continue
+
+                    # Get domain prompts for this label
+                    prompts = DOMAIN_PROMPTS.get(label.lower(), [label])
+                    if isinstance(prompts, str):
+                        prompts = [prompts]
+
+                    logger.info(f"Batch predicting '{label}' for task {task_id} using {len(prompts)} prompts")
+
+                    # Try all prompts, keep the best result
+                    best_mask = None
+                    best_score = 0.0
+
+                    for text_prompt in prompts:
+                        inputs = processor(
+                            images=image,
+                            text=text_prompt,
+                            return_tensors="pt"
+                        ).to(DEVICE)
+
+                        with torch.no_grad():
+                            outputs = model(**inputs)
+
+                        pred_masks = outputs.pred_masks[0]
+                        pred_logits = torch.sigmoid(outputs.pred_logits[0])
+
+                        presence = 1.0
+                        if hasattr(outputs, 'presence_logits') and outputs.presence_logits is not None:
+                            presence = torch.sigmoid(outputs.presence_logits[0, 0]).item()
+
+                        final_scores = pred_logits * presence
+                        threshold = 0.05
+                        keep_indices = torch.where(final_scores > threshold)[0]
+
+                        if len(keep_indices) == 0:
+                            continue
+
+                        # Use highest scoring mask
+                        idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
+                        score = final_scores[idx].item()
+
+                        if score > best_score:
+                            best_score = score
+                            mask_prob = torch.sigmoid(pred_masks[idx])
+                            mask_resized = F.interpolate(
+                                mask_prob.unsqueeze(0).unsqueeze(0),
+                                size=(img_h, img_w),
+                                mode='bilinear',
+                                align_corners=False
+                            )[0, 0]
+                            best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
+
+                    if best_mask is not None:
+                        label_id = str(uuid4())[:4]
+                        mask_uint8 = (best_mask * 255).astype(np.uint8)
+                        rle = brush.mask2rle(mask_uint8)
+
+                        task_results.append({
+                            'id': label_id,
+                            'from_name': from_name,
+                            'to_name': to_name,
+                            'original_width': img_w,
+                            'original_height': img_h,
+                            'image_rotation': 0,
+                            'value': {
+                                'format': 'rle',
+                                'rle': rle,
+                                'brushlabels': [label],
+                            },
+                            'score': best_score,
+                            'type': 'brushlabels',
+                            'readonly': False
+                        })
+                        logger.info(f"  Found '{label}' with score {best_score:.3f}")
+
+                if task_results:
+                    all_predictions.append({
+                        'result': task_results,
+                        'model_version': self.get('model_version'),
+                        'score': sum(r['score'] for r in task_results) / len(task_results)
+                    })
+
+            except Exception as e:
+                logger.error(f"Error processing task {task_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        return ModelResponse(predictions=all_predictions)
+
     def predict(self, tasks: List[Dict], context: Optional[Dict] = None,
                 **kwargs) -> ModelResponse:
         """Generate predictions for Label Studio tasks.
 
         This method is called when the user places keypoints or rectangles
-        on an image in interactive mode.
+        on an image in interactive mode, OR in batch mode for automatic predictions.
+
+        Batch mode is enabled by:
+        - Setting SAM3_BATCH_LABELS environment variable (comma-separated labels)
+        - Or passing batch_labels in kwargs
+
+        Example: SAM3_BATCH_LABELS="road,paved path,marked crossing"
 
         Args:
             tasks: List of Label Studio tasks
             context: Interactive annotation context with current selections
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments (batch_labels for batch mode)
 
         Returns:
             ModelResponse with predicted masks
         """
-        # If no context, no interaction has happened yet - return early
-        if not context or not context.get('result'):
-            return ModelResponse(predictions=[])
-
         from_name, to_name, value = self.get_first_tag_occurence('BrushLabels', 'Image')
+
+        # If no context, check for batch mode
+        if not context or not context.get('result'):
+            batch_labels = kwargs.get('batch_labels') or BATCH_LABELS
+
+            if batch_labels:
+                labels = batch_labels.split(',') if isinstance(batch_labels, str) else batch_labels
+                logger.info(f"Batch mode enabled with labels: {labels}")
+                return self._batch_predict(tasks, labels, from_name, to_name, value)
+
+            # No batch labels - return empty (no interaction yet)
+            return ModelResponse(predictions=[])
 
         # Get image dimensions from context
         image_width = context['result'][0]['original_width']
