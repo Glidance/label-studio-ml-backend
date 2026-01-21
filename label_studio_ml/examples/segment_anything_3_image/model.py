@@ -362,9 +362,9 @@ class SAM3Model(LabelStudioMLBase):
             best_score = 0.0
             best_prompt = None
             max_presence = 0.0  # Track highest presence across all prompts
+            prompt_scores = []  # Track scores for all prompts for logging
 
             for text_prompt in prompts:
-                logger.info(f"  Trying prompt: '{text_prompt}'")
 
                 # Run text-prompted inference
                 inputs = processor(
@@ -392,12 +392,22 @@ class SAM3Model(LabelStudioMLBase):
                 threshold = 0.05
                 keep_indices = torch.where(final_scores > threshold)[0]
 
-                logger.info(f"    Presence: {presence:.3f}, kept {len(keep_indices)} masks")
-
                 if len(keep_indices) == 0:
+                    prompt_scores.append({
+                        'prompt': text_prompt,
+                        'presence': presence,
+                        'best_score': 0.0,
+                        'masks_kept': 0,
+                        'selected': False
+                    })
+                    logger.info(f"    Presence: {presence:.3f}, no masks above threshold")
                     continue
 
                 mask_h, mask_w = pred_masks.shape[1], pred_masks.shape[2]
+
+                # Track best score for THIS prompt
+                prompt_best_score = 0.0
+                prompt_best_mask = None
 
                 # Find mask containing click point (if provided)
                 if point_coords and len(point_coords) > 0:
@@ -412,9 +422,8 @@ class SAM3Model(LabelStudioMLBase):
 
                         if point_activation > 0.5:
                             score = final_scores[idx].item()
-                            if score > best_score:
-                                best_score = score
-                                best_prompt = text_prompt
+                            if score > prompt_best_score:
+                                prompt_best_score = score
                                 # Resize and store mask
                                 mask_resized = F.interpolate(
                                     mask_prob.unsqueeze(0).unsqueeze(0),
@@ -422,22 +431,48 @@ class SAM3Model(LabelStudioMLBase):
                                     mode='bilinear',
                                     align_corners=False
                                 )[0, 0]
-                                best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
+                                prompt_best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
                 else:
                     # No click point - use highest scoring mask for this prompt
                     idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
-                    score = final_scores[idx].item()
-                    if score > best_score:
-                        best_score = score
-                        best_prompt = text_prompt
-                        mask_prob = torch.sigmoid(pred_masks[idx])
-                        mask_resized = F.interpolate(
-                            mask_prob.unsqueeze(0).unsqueeze(0),
-                            size=(img_h, img_w),
-                            mode='bilinear',
-                            align_corners=False
-                        )[0, 0]
-                        best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
+                    prompt_best_score = final_scores[idx].item()
+                    mask_prob = torch.sigmoid(pred_masks[idx])
+                    mask_resized = F.interpolate(
+                        mask_prob.unsqueeze(0).unsqueeze(0),
+                        size=(img_h, img_w),
+                        mode='bilinear',
+                        align_corners=False
+                    )[0, 0]
+                    prompt_best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
+
+                # Record this prompt's results
+                prompt_scores.append({
+                    'prompt': text_prompt,
+                    'presence': presence,
+                    'best_score': prompt_best_score,
+                    'masks_kept': len(keep_indices),
+                    'selected': False
+                })
+
+                # Update global best if this prompt is better
+                if prompt_best_score > best_score and prompt_best_mask is not None:
+                    best_score = prompt_best_score
+                    best_prompt = text_prompt
+                    best_mask = prompt_best_mask
+
+            # Mark the selected prompt
+            for ps in prompt_scores:
+                if ps['prompt'] == best_prompt:
+                    ps['selected'] = True
+
+            # Log prompt comparison summary
+            logger.info(f"=== PROMPT SCORES for label '{label}' ===")
+            # Sort by score descending for easy comparison
+            sorted_scores = sorted(prompt_scores, key=lambda x: x['best_score'], reverse=True)
+            for ps in sorted_scores:
+                marker = " <<<SELECTED" if ps['selected'] else ""
+                logger.info(f"  '{ps['prompt']}': score={ps['best_score']:.3f}, presence={ps['presence']:.3f}, masks={ps['masks_kept']}{marker}")
+            logger.info(f"=======================================")
 
             # METHOD 4 FALLBACK: If no good result from any prompt, fall back to point-only
             if best_mask is None or max_presence < PRESENCE_THRESHOLD:
@@ -545,6 +580,8 @@ class SAM3Model(LabelStudioMLBase):
                     # Try all prompts, keep the best result
                     best_mask = None
                     best_score = 0.0
+                    best_prompt = None
+                    prompt_scores = []  # Track scores for all prompts
 
                     for text_prompt in prompts:
                         inputs = processor(
@@ -568,14 +605,28 @@ class SAM3Model(LabelStudioMLBase):
                         keep_indices = torch.where(final_scores > threshold)[0]
 
                         if len(keep_indices) == 0:
+                            prompt_scores.append({
+                                'prompt': text_prompt,
+                                'presence': presence,
+                                'best_score': 0.0,
+                                'masks_kept': 0
+                            })
                             continue
 
                         # Use highest scoring mask
                         idx = keep_indices[torch.argmax(final_scores[keep_indices])].item()
                         score = final_scores[idx].item()
 
+                        prompt_scores.append({
+                            'prompt': text_prompt,
+                            'presence': presence,
+                            'best_score': score,
+                            'masks_kept': len(keep_indices)
+                        })
+
                         if score > best_score:
                             best_score = score
+                            best_prompt = text_prompt
                             mask_prob = torch.sigmoid(pred_masks[idx])
                             mask_resized = F.interpolate(
                                 mask_prob.unsqueeze(0).unsqueeze(0),
@@ -584,6 +635,13 @@ class SAM3Model(LabelStudioMLBase):
                                 align_corners=False
                             )[0, 0]
                             best_mask = (mask_resized > MASK_THRESHOLD).cpu().numpy().astype(np.uint8)
+
+                    # Log prompt comparison summary
+                    logger.info(f"  === PROMPT SCORES for '{label}' (task {task_id}) ===")
+                    sorted_scores = sorted(prompt_scores, key=lambda x: x['best_score'], reverse=True)
+                    for ps in sorted_scores:
+                        marker = " <<<SELECTED" if ps['prompt'] == best_prompt else ""
+                        logger.info(f"    '{ps['prompt']}': score={ps['best_score']:.3f}, presence={ps['presence']:.3f}, masks={ps['masks_kept']}{marker}")
 
                     if best_mask is not None:
                         # Filter by minimum confidence threshold
