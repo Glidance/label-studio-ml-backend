@@ -124,16 +124,6 @@ try:
 except Exception as e:
     logger.warning(f"Sam3Tracker fallback failed: {e}")
 
-# Apply torch.compile() for optimized GPU execution
-# Note: First prediction will be slow (~30-60s) due to JIT compilation
-if torch.cuda.is_available():
-    if model is not None:
-        model = torch.compile(model, mode="reduce-overhead")
-        logger.info("Sam3Model compiled with torch.compile()")
-    if tracker_model is not None:
-        tracker_model = torch.compile(tracker_model, mode="reduce-overhead")
-        logger.info("Sam3TrackerModel compiled with torch.compile()")
-
 # If primary model failed, use tracker as primary
 if MODEL_TYPE is None and tracker_processor is not None:
     processor = tracker_processor
