@@ -106,9 +106,10 @@ try:
     from transformers import Sam3Processor, Sam3Model
     processor = Sam3Processor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     model = Sam3Model.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
+    model = model.half()  # FP16 for faster inference
     model.eval()
     MODEL_TYPE = "sam3"
-    logger.info("SAM3 model (text-capable) loaded successfully")
+    logger.info("SAM3 model (text-capable) loaded successfully with FP16")
 except Exception as e:
     logger.warning(f"Sam3 (text-capable) failed: {e}")
 
@@ -117,10 +118,21 @@ try:
     from transformers import Sam3TrackerProcessor, Sam3TrackerModel
     tracker_processor = Sam3TrackerProcessor.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     tracker_model = Sam3TrackerModel.from_pretrained(MODEL_NAME, token=HF_TOKEN).to(DEVICE)
+    tracker_model = tracker_model.half()  # FP16 for faster inference
     tracker_model.eval()
-    logger.info("SAM3 Tracker (point-only) loaded for fallback")
+    logger.info("SAM3 Tracker (point-only) loaded for fallback with FP16")
 except Exception as e:
     logger.warning(f"Sam3Tracker fallback failed: {e}")
+
+# Apply torch.compile() for optimized GPU execution
+# Note: First prediction will be slow (~30-60s) due to JIT compilation
+if torch.cuda.is_available():
+    if model is not None:
+        model = torch.compile(model, mode="reduce-overhead")
+        logger.info("Sam3Model compiled with torch.compile()")
+    if tracker_model is not None:
+        tracker_model = torch.compile(tracker_model, mode="reduce-overhead")
+        logger.info("Sam3TrackerModel compiled with torch.compile()")
 
 # If primary model failed, use tracker as primary
 if MODEL_TYPE is None and tracker_processor is not None:
